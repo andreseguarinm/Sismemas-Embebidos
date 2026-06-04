@@ -1,1 +1,937 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Dashboard Pub/Sub v22 - Gemelo MeArm Corregido</title>
 
+  <!-- MAPA DE IMPORTACIONES (VITAL PARA QUE FUNCIONE THREE.JS Y ORBITCONTROLS) -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.158/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      margin: 0; padding: 0;
+      background: #ececec;
+      font-family: system-ui, sans-serif;
+    }
+    h3 { margin: 0 0 8px 0; }
+    #grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 12px;
+      padding: 12px;
+    }
+    .panel {
+      background: #fff;
+      padding: 12px;
+      border-radius: 10px;
+      box-shadow: 0px 2px 6px #0002;
+    }
+    #log {
+      background: #111; color: #0f0;
+      height: 200px; overflow-y: auto;
+      border-radius: 6px; padding: 10px;
+      white-space: pre-wrap; font-family: monospace;
+    }
+    .topic-btn {
+      padding: 4px 8px; background: #ccc;
+      border-radius: 6px; border: none;
+      margin: 2px; cursor: pointer; font-size: 0.8rem;
+    }
+    .topic-btn.active {
+      background: #4caf50; color: white;
+    }
+    #cam-wrap {
+      width: 100%; background: #111; border: 1px solid #555; border-radius:4px;
+      overflow: hidden; aspect-ratio: 4/3;
+    }
+    #cam {
+      width: 100%; height: 100%;
+      image-rendering: pixelated; image-rendering: crisp-edges;
+      display: block;
+    }
+    #panel-camera { min-width: 280px; }
+    input, button, textarea {
+      margin: 4px 0; width: 100%; padding: 6px;
+      box-sizing: border-box; font-size: 1rem;
+    }
+    textarea { height: 80px; resize: vertical; }
+  </style>
+</head>
+
+<body>
+  <div id="grid">
+    <!-- PANEL 1: CONEXIÓN WS -->
+    <section class="panel" id="panel-connection">
+      <h3>Conexión WebSocket</h3>
+      <label>IP del Broker:</label>
+      <input id="ip" value="192.168.1.3">
+      <label>Puerto:</label>
+      <input id="port" value="5052">
+      <button id="btnConnect">Conectar</button>
+      <button id="btnDisconnect" disabled>Desconectar</button>
+      <p id="status">Desconectado</p>
+    </section>
+
+ <script>
+  const params = new URLSearchParams(window.location.search);
+  const robotId = params.get("robot") || "9";
+
+  let CLIENT_MAC = localStorage.getItem("client_mac");
+  if (!CLIENT_MAC) {
+      CLIENT_MAC = crypto.randomUUID();
+      localStorage.setItem("client_mac", CLIENT_MAC);
+  }
+
+  let ws = null;
+  const statusBox = document.getElementById("status");
+  const btnConnect = document.getElementById("btnConnect");
+  const btnDisconnect = document.getElementById("btnDisconnect");
+
+  btnConnect.onclick = () => {
+    const ip = document.getElementById("ip").value;
+    const port = document.getElementById("port").value;
+    const url = `ws://${ip}:${port}/ws`;
+
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      statusBox.textContent = "🟢 Conectado";
+      btnConnect.disabled = true;
+      btnDisconnect.disabled = true;
+      addLog("debug", "WS conectado");
+      for (const pattern in window.bus.subs) {
+        if (pattern === "*") continue;
+        ws.send(JSON.stringify({ action: "SUB", topic: pattern }));
+      }
+    };
+
+    ws.onclose = () => {
+      statusBox.textContent = "🔴 Desconectado";
+      btnConnect.disabled = false;
+      btnDisconnect.disabled = true;
+      addLog("debug", "WS cerrado");
+    };
+
+    ws.onerror = (e) => { addLog("debug", "WS error: " + e.message); };
+    ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } 
+        catch (e) { return; }     
+        if (msg.action === "PUB") {
+            window.bus.publish(msg.topic, msg.data);
+        }       
+    };
+  };
+
+  btnDisconnect.onclick = () => { if (ws) ws.close(); };
+  </script>
+
+    <!-- PANEL 1.5: SUSCRIPCIONES ACTIVAS -->
+    <section class="panel" id="panel-subs">
+      <h3>Suscripciones del PubSub</h3>
+      <button id="btnRefreshSubs">Actualizar</button>
+      <ul id="subsList" style="list-style: none; padding-left: 0; font-family: monospace; font-size: 0.85rem;"></ul>
+    </section>
+
+<script>
+function compareTopics(pattern, topic) {
+    const p = pattern.split('/');
+    const t = topic.split('/');
+    for (let i = 0; i < p.length; i++) {
+        if (p[i] === '#') return true;
+        if (p[i] === '+') { if (i >= t.length) return false; continue; }
+        if (i >= t.length) return false;
+        if (p[i] !== t[i]) return false;
+    }
+    return p.length === t.length;
+}
+
+class PubSub {
+    constructor() { this.subs = {}; }
+    subscribe(pattern, cb) {
+        if (!this.subs[pattern]) this.subs[pattern] = [];
+        this.subs[pattern].push(cb);
+        refreshSubscriptionsPanel()
+    }
+    publish(topic, message) {
+        for (const pattern in this.subs) {
+            if (compareTopics(pattern, topic)) {
+                this.subs[pattern].forEach(cb => cb(topic, message));
+            }
+        }
+        if (this.subs["*"]) this.subs["*"].forEach(cb => cb(topic,  message));
+    }
+}
+
+// Declarado en window para que los módulos importados lo puedan ver sin problemas
+window.bus = new PubSub();
+const bus = window.bus; 
+
+const subsList = document.getElementById("subsList");
+const btnRefreshSubs = document.getElementById("btnRefreshSubs");
+
+function refreshSubscriptionsPanel() {
+    subsList.innerHTML = "";
+    for (const pattern in bus.subs) {
+        const count = bus.subs[pattern].length;
+        const li = document.createElement("li");
+        li.innerHTML = `<b>${pattern}</b> <span style="color:#888">(${count} callback${count!==1?'s':''})</span>`;
+        subsList.appendChild(li);
+    }
+}
+btnRefreshSubs.onclick = refreshSubscriptionsPanel;
+refreshSubscriptionsPanel();
+</script>
+
+    <!-- PANEL 2: ENVÍO DE MENSAJES -->
+    <section class="panel" id="panel-messages">
+      <h3>Mensajes</h3>
+      <label>Prefijo base</label>
+      <input id="basePrefix" value="UDFJC/emb1">
+      <label>ID del robot</label>
+      <input id="robotId" type="number" value="9" min="0" step="1">
+      <label>Prefijo completo (solo lectura)</label>
+      <input id="fullPrefix" >
+      <hr>
+      <label>Tópico (sufijo)</label>
+      <input id="msgTopic" value="RPi/sequence">
+      <label>Payload JSON</label>
+      <textarea id="msgPayload">{"action": "execute_now", "name": "ymca"}</textarea>
+      <button id="btnPub">Publicar</button>
+      <button id="btnSub">Suscribir</button>
+    </section>
+
+  <script>
+const basePrefixInput = document.getElementById("basePrefix");
+const robotIdInput    = document.getElementById("robotId");
+robotIdInput.value = robotId;
+const fullPrefixInput = document.getElementById("fullPrefix");
+
+function updatePrefixFromParts() {
+    let base = (basePrefixInput.value || "").trim();
+    if (base.endsWith("/")) base = base.slice(0, -1);
+    let rId = robotIdInput.value;
+    if (rId === "") rId = "0";
+    fullPrefixInput.value = base + "/robot" + rId + "/";
+    bus.prefix = fullPrefixInput.value;
+}
+
+updatePrefixFromParts()
+basePrefixInput.onchange = updatePrefixFromParts;
+robotIdInput.onchange = updatePrefixFromParts;
+fullPrefixInput.onchange = () => { bus.prefix = fullPrefixInput.value.trim(); };
+
+bus.pub = function (topic, message) {
+    bus.publish(topic, message);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: "PUB", topic, data: message }));
+    }
+};
+
+bus.pub_pre = function (sufijo, message) {
+    let suf = (sufijo || "").trim();
+    if (suf.startsWith("/")) suf = suf.slice(1);
+    bus.pub(bus.prefix + suf, message);
+};
+
+bus.sub = function (topic, callback) {
+    bus.subscribe(topic, callback);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: "SUB", topic }));
+    }
+};
+
+bus.sub_pre = function (sufijo, callback) {
+    let suf = (sufijo || "").trim();
+    if (suf.startsWith("/")) suf = suf.slice(1);
+    bus.sub(bus.prefix + suf, callback);
+};
+
+document.getElementById("btnPub").onclick = () => {
+    const sufix = document.getElementById("msgTopic").value;
+    const topic = `${bus.prefix}${sufix}`;
+    const data  = JSON.parse(document.getElementById("msgPayload").value);
+    bus.pub(topic, data);
+};
+
+document.getElementById("btnSub").onclick = () => {
+    const sufix = document.getElementById("msgTopic").value;
+    const topic = `${bus.prefix}${sufix}`;
+    bus.sub(topic, (msg, t) => { addLog(t, "SUB recibió mensaje"); });
+};
+  </script>
+
+    <!-- PANEL 3: LOG -->
+    <section class="panel" id="panel-log">
+      <h3>Log</h3>
+      <div id="filters"></div>
+      <pre id="log"></pre>
+    </section>
+<script>
+  const logBox = document.getElementById("log");
+  const filtersDiv = document.getElementById("filters");
+  const topicButtons = {};
+  let visibleTopics = new Set();
+
+  function addTopicButton(topic) {
+    if (topicButtons[topic]) return;
+    visibleTopics.add(topic);
+    const btn = document.createElement("button");
+    btn.className = "topic-btn active";
+    btn.textContent = topic;
+    btn.onclick = () => {
+      const active = btn.classList.toggle("active");
+      if (active) visibleTopics.add(topic);
+      else visibleTopics.delete(topic);
+    };
+    filtersDiv.appendChild(btn);
+    topicButtons[topic] = btn;
+  }
+
+  function addLog(topic, txt) {
+    if (!topicButtons[topic]) addTopicButton(topic);
+    if (!visibleTopics.has(topic)) return;
+    logBox.textContent += `[${topic}] ${txt}\n`;
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  bus.subscribe("*", (topic, msg) => {
+    if (typeof msg === 'object') addLog(topic, JSON.stringify(msg));
+    else addLog(topic, msg);
+  });
+</script>
+
+    <!-- PANEL BATERÍA -->
+    <section class="panel" id="panel-battery">
+      <h3>Nivel de Batería</h3>
+      <div id="bat-value" style="font-size:2.8rem; font-weight:700; text-align:center; margin:0.5rem 0; color:#2e7d32;">-- V</div>
+      <div style="background:#e0e0e0; border-radius:8px; height:18px; overflow:hidden; margin:0.4rem 0;">
+        <div id="bat-bar" style="height:100%; width:0%; background:#2e7d32; border-radius:8px; transition:width 0.3s ease, background 0.3s ease;"></div>
+      </div>
+      <p id="bat-status" style="text-align:center; color:#666; font-size:0.85rem; margin:0.3rem 0;">Esperando datos...</p>
+    </section>
+    <script>
+    bus.sub_pre("sensor/battery", (topic, payload) => {
+        const v_real = payload.v_real, v_max = payload.v_max, v_adc = payload.v_adc;
+        let pct = Math.max(0, Math.min((v_real / v_max) * 100, 100));
+        let color = "#2e7d32"; 
+        if (pct < 30) color = "#d32f2f"; 
+        else if (pct < 60) color = "#f57c00"; 
+        document.getElementById("bat-value").textContent = v_real.toFixed(2) + " V";
+        document.getElementById("bat-value").style.color = color;
+        document.getElementById("bat-bar").style.width = pct + "%";
+        document.getElementById("bat-bar").style.background = color;
+        document.getElementById("bat-status").textContent = `ADC: ${v_adc.toFixed(2)}V | Carga: ${pct.toFixed(1)}%`;
+    });
+    </script>
+
+    <!-- PANEL 4: CÁMARA -->
+    <section class="panel" id="panel-camera">
+      <h3>Cámara (camera/frame)</h3>
+      <div id="cam-wrap">
+        <canvas id="cam"></canvas>
+      </div>
+      <p id="camInfo"></p>
+    </section>
+  <script>
+  // Canvas principal (visible, siempre llena el contenedor)
+  const canvas = document.getElementById("cam");
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;   // mantiene el look pixelado al escalar
+
+  // Canvas auxiliar invisible donde pintamos el frame a resolución nativa
+  const offscreen = document.createElement("canvas");
+  const offCtx = offscreen.getContext("2d");
+
+  bus.sub_pre("camera/frame", (topic, payload) => {
+      const w = payload.w, h = payload.h;
+      const b64 = payload.frame.replace(/\s/g, '');
+      const binary = atob(b64);
+      const u8 = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) u8[i] = binary.charCodeAt(i);
+
+      // 1. Pintar frame RGB565 en el canvas auxiliar a resolución real (ej. 80×60)
+      if (offscreen.width !== w || offscreen.height !== h) {
+          offscreen.width  = w;
+          offscreen.height = h;
+      }
+      const imgData = offCtx.createImageData(w, h);
+      const data = imgData.data;
+      for (let i = 0; i < u8.length; i += 2) {
+          const rgb565 = (u8[i] << 8) | u8[i+1];
+          data[(i >> 1) * 4]     = ((rgb565 >> 11) & 0x1F) << 3;
+          data[(i >> 1) * 4 + 1] = ((rgb565 >> 5)  & 0x3F) << 2;
+          data[(i >> 1) * 4 + 2] =  (rgb565        & 0x1F) << 3;
+          data[(i >> 1) * 4 + 3] = 255;
+      }
+      offCtx.putImageData(imgData, 0, 0);
+
+      // 2. Escalar el canvas principal al tamaño interno correcto
+      //    (mantiene proporciones del frame, el CSS lo estira al contenedor)
+      if (canvas.width !== w || canvas.height !== h) {
+          canvas.width  = w;
+          canvas.height = h;
+      }
+
+      // 3. Dibujar el offscreen escalado al canvas principal (pixelado)
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(offscreen, 0, 0, w, h);
+
+      document.getElementById("camInfo").textContent =
+          `Frame RGB565 ~ ${u8.length} bytes (${w}x${h})`;
+  });
+  </script>
+
+    <!-- PANEL 5: SENSOR DE DISTANCIA HC-SR04 -->
+    <section class="panel" id="panel-distance">
+      <h3>Distancia (sensor HC-SR04)</h3>
+      <div id="dist-value" style="font-size:2.8rem; font-weight:700; text-align:center; margin:0.5rem 0; color:#1a73e8;">— cm</div>
+      <div id="dist-bar-wrap" style="background:#e0e0e0; border-radius:8px; height:18px; overflow:hidden; margin:0.4rem 0;">
+        <div id="dist-bar" style="height:100%; width:0%; background:#1a73e8; border-radius:8px; transition:width 0.3s ease;"></div>
+      </div>
+      <p id="dist-status" style="text-align:center; color:#666; font-size:0.85rem; margin:0.3rem 0;">Esperando datos...</p>
+      <canvas id="dist-history" width="260" height="80" style="width:100%; border:1px solid #ccc; border-radius:6px; margin-top:0.5rem;"></canvas>
+    </section>
+  <script>
+  const distValue = document.getElementById("dist-value"), distBar = document.getElementById("dist-bar");
+  const distStatus = document.getElementById("dist-status"), distCanvas = document.getElementById("dist-history");
+  const distCtx = distCanvas.getContext("2d");
+  const MAX_RANGE_CM = 100, HISTORY_LEN = 30, distHistory = [];
+
+  function drawDistHistory() {
+    const W = distCanvas.width, H = distCanvas.height;
+    distCtx.clearRect(0, 0, W, H);
+    if (distHistory.length < 2) return;
+    distCtx.strokeStyle = "#e0e0e0"; distCtx.lineWidth = 1; distCtx.beginPath();
+    const refY = H - (50 / MAX_RANGE_CM) * H; distCtx.moveTo(0, refY); distCtx.lineTo(W, refY); distCtx.stroke();
+    distCtx.strokeStyle = "#1a73e8"; distCtx.lineWidth = 2; distCtx.beginPath();
+    distHistory.forEach((v, i) => {
+      const x = (i / (HISTORY_LEN - 1)) * W, y = H - Math.min(v, MAX_RANGE_CM) / MAX_RANGE_CM * H;
+      i === 0 ? distCtx.moveTo(x, y) : distCtx.lineTo(x, y);
+    });
+    distCtx.stroke();
+  }
+
+  bus.sub_pre("sensor/distance", (topic, payload) => {
+    const cm = payload.distance_cm, status = payload.status;
+    if (status === "ok") {
+      const color = cm < 20 ? "#d32f2f" : cm < 50 ? "#f57c00" : "#2e7d32"; 
+      distValue.textContent = cm.toFixed(1) + " cm"; distValue.style.color = color;
+      distBar.style.width = Math.min((cm / MAX_RANGE_CM) * 100, 100) + "%"; distBar.style.background = color;
+      distStatus.textContent = `✅ OK · ${new Date().toLocaleTimeString()}`;
+      distHistory.push(cm);
+    } else { 
+      distValue.textContent = status === "too_close" ? "< 2 cm" : status === "out_of_range" ? "> 100 cm" : "— cm";
+      distValue.style.color = status === "too_close" ? "#d32f2f" : "#9e9e9e";
+      distBar.style.width = status === "too_close" ? "100%" : "0%";
+      distBar.style.background = status === "too_close" ? "#d32f2f" : "#9e9e9e";
+      distStatus.textContent = "⚠️ " + status;
+      distHistory.push(status === "too_close" ? 0 : status === "out_of_range" ? MAX_RANGE_CM : -1);
+    }
+    if (distHistory.length > HISTORY_LEN) distHistory.shift();
+    drawDistHistory();
+  });
+  </script>
+
+    <!-- PANEL 6: COLORES Y COLUMNAS CÁMARA CON CENTROIDES -->
+    <section class="panel" id="panel-colors">
+      <h3>Colores y Columnas Cámara</h3>
+      <div style="position:relative; background:#222; border-radius:6px; height:28px; margin-bottom:10px; overflow:hidden;">
+        <div style="position:absolute; left:50%; top:0; width:2px; height:100%; background:#ffffff44;"></div>
+        <div id="marker-red" style="position:absolute; top:3px; width:10px; height:22px; border-radius:3px; background:#d32f2f; transform:translateX(-50%); transition:left 0.3s; display:none;"></div>
+        <div id="marker-blue" style="position:absolute; top:3px; width:10px; height:22px; border-radius:3px; background:#1565c0; transform:translateX(-50%); transition:left 0.3s; display:none;"></div>
+        <div id="marker-yellow" style="position:absolute; top:3px; width:10px; height:22px; border-radius:3px; background:#f9a825; transform:translateX(-50%); transition:left 0.3s; display:none;"></div>
+        <div style="position:absolute; bottom:1px; right:4px; font-size:0.6rem; color:#888;">← izq · centro · der →</div>
+      </div>
+
+      <div id="color-cards" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+        <div class="color-card" id="card-red" style="flex:1; min-width:80px; background:#ffebee; border-left:5px solid #d32f2f; border-radius:8px; padding:8px 10px;">
+          <div style="font-weight:700; color:#d32f2f; font-size:1rem;">🔴 Rojo</div>
+          <div style="font-size:1.5rem; font-weight:700; margin:4px 0;" id="red-cols">—</div>
+          <div style="font-size:0.72rem; color:#555;">columna (1=izq)</div>
+          <div style="margin-top:6px; font-size:0.82rem; color:#d32f2f; font-weight:600;" id="red-offset">— del centro</div>
+          <div style="background:#ffcdd2; border-radius:4px; height:8px; margin-top:6px; overflow:hidden;"><div id="red-bar" style="height:100%; width:50%; background:#d32f2f; border-radius:4px; transition:width 0.3s;"></div></div>
+        </div>
+        <div class="color-card" id="card-blue" style="flex:1; min-width:80px; background:#e3f2fd; border-left:5px solid #1565c0; border-radius:8px; padding:8px 10px;">
+          <div style="font-weight:700; color:#1565c0; font-size:1rem;">🔵 Azul</div>
+          <div style="font-size:1.5rem; font-weight:700; margin:4px 0;" id="blue-cols">—</div>
+          <div style="font-size:0.72rem; color:#555;">columna (1=izq)</div>
+          <div style="margin-top:6px; font-size:0.82rem; color:#1565c0; font-weight:600;" id="blue-offset">— del centro</div>
+          <div style="background:#bbdefb; border-radius:4px; height:8px; margin-top:6px; overflow:hidden;"><div id="blue-bar" style="height:100%; width:50%; background:#1565c0; border-radius:4px; transition:width 0.3s;"></div></div>
+        </div>
+        <div class="color-card" id="card-yellow" style="flex:1; min-width:80px; background:#fffde7; border-left:5px solid #f9a825; border-radius:8px; padding:8px 10px;">
+          <div style="font-weight:700; color:#f57f17; font-size:1rem;">🟡 Amarillo</div>
+          <div style="font-size:1.5rem; font-weight:700; margin:4px 0;" id="yellow-cols">—</div>
+          <div style="font-size:0.72rem; color:#555;">columna (1=izq)</div>
+          <div style="margin-top:6px; font-size:0.82rem; color:#f57f17; font-weight:600;" id="yellow-offset">— del centro</div>
+          <div style="background:#fff9c4; border-radius:4px; height:8px; margin-top:6px; overflow:hidden;"><div id="yellow-bar" style="height:100%; width:50%; background:#f9a825; border-radius:4px; transition:width 0.3s;"></div></div>
+        </div>
+      </div>
+      <canvas id="color-hist" width="280" height="70" style="width:100%; border:1px solid #ddd; border-radius:6px;"></canvas>
+      <p id="color-last-update" style="font-size:0.72rem; color:#aaa; margin-top:6px;">Esperando datos...</p>
+    </section>
+
+  <script>
+  const colorHistCanvas = document.getElementById("color-hist");
+  const colorHistCtx    = colorHistCanvas.getContext("2d");
+  const COLOR_HISTORY_LEN = 20, colorHistory = [];
+  const elRedCols = document.getElementById("red-cols"), elBlueCols = document.getElementById("blue-cols"), elYellowCols = document.getElementById("yellow-cols");
+  const elRedOff = document.getElementById("red-offset"), elBlueOff = document.getElementById("blue-offset"), elYellowOff = document.getElementById("yellow-offset");
+  const elRedBar = document.getElementById("red-bar"), elBlueBar = document.getElementById("blue-bar"), elYellowBar = document.getElementById("yellow-bar");
+  const elColorUpdate = document.getElementById("color-last-update");
+  const markerRed = document.getElementById("marker-red"), markerBlue = document.getElementById("marker-blue"), markerYellow = document.getElementById("marker-yellow");
+
+  function updateCard(elCol, elOff, elBar, marker, data, fw) {
+    if (!data || !data.detected || data.column == null) {
+      elCol.textContent = "no det."; elOff.textContent = "—"; elBar.style.width = "50%"; marker.style.display = "none"; return null;
+    }
+    elCol.textContent = `col. ${data.column}`;
+    const off = data.offset_center;
+    elOff.textContent = off < 0 ? `${Math.abs(off).toFixed(1)} a la izq` : off > 0 ? `${off.toFixed(1)} a la der` : "en el centro";
+    const barPct = ((data.column - 1) / (fw - 1) * 100).toFixed(1);
+    elBar.style.width = barPct + "%";
+    marker.style.left = barPct + "%"; marker.style.display = "block";
+    return data.column;
+  }
+
+  function drawColorHistory(fw) {
+    const W = colorHistCanvas.width, H = colorHistCanvas.height;
+    colorHistCtx.clearRect(0, 0, W, H);
+    colorHistCtx.strokeStyle = "#cccccc55"; colorHistCtx.lineWidth = 1; colorHistCtx.beginPath();
+    colorHistCtx.moveTo(0, H / 2); colorHistCtx.lineTo(W, H / 2); colorHistCtx.stroke();
+    if (colorHistory.length < 2) return;
+    const colors = ["#d32f2f", "#1565c0", "#f9a825"], keys = ["r", "b", "y"];
+    keys.forEach((k, ki) => {
+      colorHistCtx.strokeStyle = colors[ki]; colorHistCtx.lineWidth = 1.8; colorHistCtx.beginPath();
+      let first = true;
+      colorHistory.forEach((entry, i) => {
+        if (entry[k] == null) { first = true; return; }
+        const x = (i / (COLOR_HISTORY_LEN - 1)) * W, y = H - ((entry[k] - 1) / (fw - 1)) * H;
+        first ? colorHistCtx.moveTo(x, y) : colorHistCtx.lineTo(x, y); first = false;
+      });
+      colorHistCtx.stroke();
+    });
+  }
+
+  bus.sub_pre("camera/colors", (topic, payload) => {
+    const fw = payload.frame_w || 160;
+    const rData = payload.red || {}, bData = payload.blue || {}, yData = payload.yellow || {};
+    updateCard(elRedCols, elRedOff, elRedBar, markerRed, rData, fw);
+    updateCard(elBlueCols, elBlueOff, elBlueBar, markerBlue, bData, fw);
+    updateCard(elYellowCols, elYellowOff, elYellowBar, markerYellow, yData, fw);
+    colorHistory.push({ r: rData.column ?? null, b: bData.column ?? null, y: yData.column ?? null });
+    if (colorHistory.length > COLOR_HISTORY_LEN) colorHistory.shift();
+    drawColorHistory(fw);
+    elColorUpdate.textContent = `Última actualización: ${new Date().toLocaleTimeString()}  |  frame: ${fw} cols`;
+  });
+  </script>
+
+    <!-- PANELES CONTROLES CARRO Y BRAZO -->
+    <section class="panel" id="panel-car">
+      <h3>Controles Carro</h3>
+      <div id="car-action-display" style="background:#f5f5f5; border-radius:8px; padding:10px; text-align:center; font-size:0.85rem; color:#555; min-height:48px; margin-bottom:12px; line-height:1.4;">Sin acción</div>
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; grid-template-rows:auto auto auto; gap:6px; width:fit-content; margin:0 auto;">
+        <div></div><button class="car-btn" id="car-up" style="font-size:1.6rem; padding:10px 14px; border-radius:8px; border:2px solid #1a73e8; background:#e8f0fe; cursor:pointer;">▲</button><div></div>
+        <button class="car-btn" id="car-left" style="font-size:1.6rem; padding:10px 14px; border-radius:8px; border:2px solid #1a73e8; background:#e8f0fe; cursor:pointer;">◄</button>
+        <button id="car-stop" style="font-size:0.75rem; padding:10px 8px; border-radius:8px; border:2px solid #d32f2f; background:#fce8e6; cursor:pointer; font-weight:700; color:#d32f2f;">STOP</button>
+        <button class="car-btn" id="car-right" style="font-size:1.6rem; padding:10px 14px; border-radius:8px; border:2px solid #1a73e8; background:#e8f0fe; cursor:pointer;">►</button>
+        <div></div><button class="car-btn" id="car-down" style="font-size:1.6rem; padding:10px 14px; border-radius:8px; border:2px solid #1a73e8; background:#e8f0fe; cursor:pointer;">▼</button><div></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-arm">
+      <h3>Controles Brazo</h3>
+      <div id="arm-action-display" style="background:#f5f5f5; border-radius:8px; padding:10px; text-align:center; font-size:0.85rem; color:#555; min-height:36px; margin-bottom:14px;">Sin acción</div>
+
+      <!-- Servo 1: Codo (0-180°) -->
+      <div style="margin-bottom:14px;">
+        <label style="font-size:0.85rem; color:#333;">Servo 1 - Codo (0° a 180°)</label>
+        <div style="display:flex; align-items:center; gap:8px; margin-top:4px;">
+          <input type="range" id="servo1-slider" min="0" max="180" value="100" style="flex:1; margin:0;">
+          <input type="number" id="servo1-num" min="0" max="180" value="100" style="width:64px; margin:0; padding:4px; font-size:0.95rem;">
+          <span style="font-size:0.85rem; color:#888;">°</span>
+        </div>
+      </div>
+
+      <!-- Servo 2: Hombro (0-180°) -->
+      <div style="margin-bottom:14px;">
+        <label style="font-size:0.85rem; color:#333;">Servo 2 - Hombro (0° a 180°)</label>
+        <div style="display:flex; align-items:center; gap:8px; margin-top:4px;">
+          <input type="range" id="servo2-slider" min="0" max="180" value="70" style="flex:1; margin:0;">
+          <input type="number" id="servo2-num" min="0" max="180" value="70" style="width:64px; margin:0; padding:4px; font-size:0.95rem;">
+          <span style="font-size:0.85rem; color:#888;">°</span>
+        </div>
+      </div>
+
+      <!-- Servo 3: Base (-90 a 90°) -->
+      <div style="margin-bottom:14px;">
+        <label style="font-size:0.85rem; color:#333;">Servo 3 - Base (-90° a 90°)</label>
+        <div style="display:flex; align-items:center; gap:8px; margin-top:4px;">
+          <input type="range" id="servo3-slider" min="-90" max="90" value="0" style="flex:1; margin:0;">
+          <input type="number" id="servo3-num" min="-90" max="90" value="0" style="width:64px; margin:0; padding:4px; font-size:0.95rem;">
+          <span style="font-size:0.85rem; color:#888;">°</span>
+        </div>
+      </div>
+
+      <button id="arm-send" style="padding:10px; border-radius:8px; border:2px solid #7b1fa2; background:#f3e5f5; cursor:pointer; font-size:1rem; width:100%; margin:0;">Enviar al robot</button>
+    </section>
+
+  <script>
+  const carActions = {
+    "car-up":    { label:"⬆️ Avanzar", action: "up" },
+    "car-down":  { label:"⬇️ Retroceder", action: "down" },
+    "car-left":  { label:"↩️ Girar izquierda 90°", action: "left" },
+    "car-right": { label:"↪️ Girar derecha 90°", action: "right" },
+    "car-stop":  { label:"🛑 STOP", action: "stop" },
+  };
+  ["car-up","car-down","car-left","car-right","car-stop"].forEach(id => {
+    document.getElementById(id).onclick = () => {
+      bus.pub_pre("car/car_vel", { action: carActions[id].action });
+      document.getElementById("car-action-display").textContent = carActions[id].label;
+    };
+  });
+
+  // Sincronizar slider <-> número para cada servo
+  function syncControls(sliderId, numId, onChange) {
+    const slider = document.getElementById(sliderId);
+    const num    = document.getElementById(numId);
+    slider.oninput = () => { num.value = slider.value; onChange(); };
+    num.oninput    = () => {
+      let v = parseInt(num.value);
+      if (isNaN(v)) return;
+      v = Math.max(parseInt(slider.min), Math.min(parseInt(slider.max), v));
+      num.value = v; slider.value = v;
+      onChange();
+    };
+  }
+
+  function publishArmAngles() {
+    const s1 = parseInt(document.getElementById("servo1-slider").value);
+    const s2 = parseInt(document.getElementById("servo2-slider").value);
+    const s3 = parseInt(document.getElementById("servo3-slider").value);
+    // Publicar al bus (el gemelo lo recibe por el bus antes de llegar al robot)
+    bus.pub_pre("arm/joint_state", { action: "set_angles", servo1: s1, servo2: s2, servo3: s3 });
+  }
+
+  // Los sliders actualizan el gemelo en tiempo real (sin esperar al botón)
+  syncControls("servo1-slider", "servo1-num", publishArmAngles);
+  syncControls("servo2-slider", "servo2-num", publishArmAngles);
+  syncControls("servo3-slider", "servo3-num", publishArmAngles);
+
+  // El botón también publica (útil si se teclea el número y se quiere confirmar)
+  document.getElementById("arm-send").onclick = () => {
+    publishArmAngles();
+    document.getElementById("arm-action-display").textContent =
+      `S1: ${document.getElementById("servo1-num").value}°  |  S2: ${document.getElementById("servo2-num").value}°  |  S3: ${document.getElementById("servo3-num").value}°`;
+  };
+  </script>
+
+    <!-- GEMELOS DIGITALES -->
+    <section class="panel" id="panel-gemelo">
+      <h3>Gemelo Carro</h3>
+      <div id="render1" style="width:100%; height:300px; border-radius:8px; background:#1a1a2e;"></div>
+    </section>
+
+    <section class="panel" id="panel-brazo3d">
+      <h3>Gemelo Brazo Acrílico (MeArm)</h3>
+      <div id="render2" style="width:100%; height:300px; border-radius:8px; background:#1a1a2e;"></div>
+    </section>
+
+  <!-- SCRIPT THREE.JS CORREGIDO CON IMPORTMAP Y GEMELO MECANICO -->
+  <script type="module">
+  import * as THREE from "three";
+  import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+  
+  const miBus = window.bus; // Acceso seguro al bus de PubSub
+
+  function initScene(containerId) {
+    const cont = document.getElementById(containerId);
+    const scene = new THREE.Scene(); scene.background = new THREE.Color(0x2a2a3e);
+    const camera = new THREE.PerspectiveCamera(50, cont.clientWidth / cont.clientHeight, 0.1, 200);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(cont.clientWidth, cont.clientHeight); 
+    renderer.shadowMap.enabled = true;
+    cont.appendChild(renderer.domElement);
+    
+    // Luces
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0); 
+    dirLight.position.set(5, 10, 5); 
+    dirLight.castShadow = true;
+    scene.add(dirLight);
+    
+    // Piso y Grilla
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), new THREE.MeshStandardMaterial({ color: 0x1f1f2e }));
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+    scene.add(new THREE.GridHelper(20, 20, 0x555577, 0x444466));
+    
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    
+    return { scene, camera, renderer, controls };
+  }
+
+  // === GEMELO CARRO ANIMADO ===
+  const carWorld = initScene("render1");
+  carWorld.camera.position.set(6, 6, 8); 
+  carWorld.controls.target.set(0, 0, 0);
+  
+  const carGroup = new THREE.Group(); carWorld.scene.add(carGroup);
+  const carMat      = new THREE.MeshStandardMaterial({color: 0xcc1a1a, roughness: 0.5});
+  const wheelMat    = new THREE.MeshStandardMaterial({color: 0x1a1a1a, roughness: 0.95});
+  const wheelRimMat = new THREE.MeshStandardMaterial({color: 0x888888, metalness: 0.6, roughness: 0.3});
+
+  // Chasis
+  const chasis = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.6, 3), carMat);
+  chasis.position.y = 0.5; chasis.castShadow = true;
+  carGroup.add(chasis);
+
+  // Ruedas traseras cilíndricas (izq y der)
+  function makeWheel(xPos, zPos) {
+    const grp = new THREE.Group();
+    const tire = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 0.35, 24), wheelMat);
+    tire.rotation.z = Math.PI / 2; tire.castShadow = true;
+    grp.add(tire);
+    const rim = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 0.38, 16), wheelRimMat);
+    rim.rotation.z = Math.PI / 2;
+    grp.add(rim);
+    grp.position.set(xPos, 0.55, zPos);
+    return grp;
+  }
+  carGroup.add(makeWheel(-1.35, -0.9));  // delantera izquierda
+  carGroup.add(makeWheel( 1.35, -0.9));  // delantera derecha
+
+  // Rueda delantera tipo ball-caster (esfera)
+  const casterBall = new THREE.Mesh(new THREE.SphereGeometry(0.30, 20, 16), wheelRimMat);
+  casterBall.position.set(0, 0.30,  1.1); casterBall.castShadow = true;
+  carGroup.add(casterBall);
+  
+  let carQueue = [], carT = 0, carCur = null, carPos = {x:0, y:0, beta:0};
+  miBus.subscribe("#", (topic, msg) => {
+    if (!topic.endsWith("car/car_vel") || !msg.action) return;
+    if (msg.action === "up") carQueue.push({type:"linear", dist:4});
+    if (msg.action === "down") carQueue.push({type:"linear", dist:-4});
+    if (msg.action === "left") carQueue.push({type:"arc", angle:Math.PI/2});
+    if (msg.action === "right") carQueue.push({type:"arc", angle:-Math.PI/2});
+  });
+
+  // === GEMELO BRAZO ACRÍLICO (ESTILO MEARM) ===
+  const armWorld = initScene("render2");
+  armWorld.camera.position.set(4, 5, 6); 
+  armWorld.controls.target.set(0, 1.5, 0);
+  
+  const armGroup = new THREE.Group(); armWorld.scene.add(armGroup);
+  
+  // Materiales fieles a la foto
+  const acrylicMat = new THREE.MeshStandardMaterial({
+    color: 0xFF2B00, // Rosa/Rojo Neón Translúcido
+    transparent: true,
+    opacity: 0.85,
+    roughness: 0.2
+  });
+  const servoMat = new THREE.MeshStandardMaterial({color: 0x111111, roughness: 0.8});
+  const jointMat = new THREE.MeshStandardMaterial({color: 0xaaaaaa, metalness: 0.5, roughness: 0.4}); // Ejes/Tornillos
+
+  // 1. Base principal
+  const basePlate = new THREE.Mesh(new THREE.BoxGeometry(3, 0.2, 3), acrylicMat);
+  basePlate.position.y = 0.1; basePlate.castShadow = true;
+  armGroup.add(basePlate);
+
+  const baseServo = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.8, 0.8), servoMat);
+  baseServo.position.y = 0.6; baseServo.castShadow = true;
+  armGroup.add(baseServo);
+
+  // 2. Turntable (Rotación de la Base - Eje Y)
+  const turntable = new THREE.Group();
+  turntable.position.y = 1.0;
+  armGroup.add(turntable);
+  
+  const turnPlate = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.2, 2.2), acrylicMat);
+  turnPlate.castShadow = true;
+  turntable.add(turnPlate);
+
+  const bracketL = new THREE.Mesh(new THREE.BoxGeometry(0.2, 1.2, 1.0), acrylicMat);
+  bracketL.position.set(-0.6, 0.7, 0); bracketL.castShadow = true;
+  turntable.add(bracketL);
+
+  const bracketR = new THREE.Mesh(new THREE.BoxGeometry(0.2, 1.2, 1.0), acrylicMat);
+  bracketR.position.set(0.6, 0.7, 0); bracketR.castShadow = true;
+  turntable.add(bracketR);
+
+  // Servo del Hombro
+  const shoulderServo = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.8, 1.2), servoMat);
+  shoulderServo.position.set(-0.8, 0.8, 0);
+  turntable.add(shoulderServo);
+
+  // 3. Articulación del Hombro (Eje X)
+  const shoulderJoint = new THREE.Group();
+  shoulderJoint.position.set(0, 1.0, 0);
+  turntable.add(shoulderJoint);
+
+  const screw1 = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 1.6, 16), jointMat);
+  screw1.rotation.z = Math.PI/2;
+  shoulderJoint.add(screw1);
+
+  // Brazo Inferior (Estructura de Acrílico Rojo - 2 placas)
+  const lowerArmL = new THREE.Mesh(new THREE.BoxGeometry(0.15, 2.5, 0.4), acrylicMat);
+  lowerArmL.position.set(-0.3, 1.25, 0); lowerArmL.castShadow = true;
+  shoulderJoint.add(lowerArmL);
+
+  const lowerArmR = new THREE.Mesh(new THREE.BoxGeometry(0.15, 2.5, 0.4), acrylicMat);
+  lowerArmR.position.set(0.3, 1.25, 0); lowerArmR.castShadow = true;
+  shoulderJoint.add(lowerArmR);
+
+  // 4. Articulación del Codo (Eje X)
+  const elbowJoint = new THREE.Group();
+  elbowJoint.position.set(0, 2.5, 0);
+  shoulderJoint.add(elbowJoint);
+
+  const screw2 = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 1.0, 16), jointMat);
+  screw2.rotation.z = Math.PI/2;
+  elbowJoint.add(screw2);
+
+  // Servo visual del Codo
+  const elbowServo = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.6, 1.0), servoMat);
+  elbowServo.position.set(0, 0, -0.3);
+  elbowJoint.add(elbowServo);
+
+  // Brazo Superior (Estructura de Acrílico Azul - 1 placa central)
+  const upperArm = new THREE.Mesh(new THREE.BoxGeometry(0.2, 2.5, 0.3), acrylicMat);
+  upperArm.position.set(0, 1.25, 0); upperArm.castShadow = true;
+  elbowJoint.add(upperArm);
+
+  // 5. Articulación de la Muñeca (Eje X compensado para ser paralelo)
+  const wristJoint = new THREE.Group();
+  wristJoint.position.set(0, 2.5, 0);
+  elbowJoint.add(wristJoint);
+
+  const screw3 = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.6, 16), jointMat);
+  screw3.rotation.z = Math.PI/2;
+  wristJoint.add(screw3);
+
+  // Base de las pinzas
+  const gripperBase = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.8, 0.15), acrylicMat);
+  gripperBase.position.set(0, 0.4, 0); gripperBase.castShadow = true;
+  wristJoint.add(gripperBase);
+
+  // Garras
+  const clawL = new THREE.Mesh(new THREE.BoxGeometry(0.15, 1.0, 0.15), acrylicMat);
+  clawL.position.set(-0.4, 1.0, 0); clawL.castShadow = true;
+  wristJoint.add(clawL);
+
+  const clawR = new THREE.Mesh(new THREE.BoxGeometry(0.15, 1.0, 0.15), acrylicMat);
+  clawR.position.set(0.4, 1.0, 0); clawR.castShadow = true;
+  wristJoint.add(clawR);
+
+  // --- ESTADO Y CINEMÁTICA ---
+  // Poses iniciales predefinidas: El estado por defecto será "contraído"
+  // lower_z: Rotación en X del hombro. Positivo = se inclina hacia atrás. Negativo = adelante.
+  // upper_z: Rotación en X del codo (relativo al hombro).
+  let armState = { rot_y: 0, shoulder: 0.5, elbow: -2.7 }; 
+  let armCur   = { rot_y: 0, shoulder: 0.5, elbow: -2.7 };
+
+  // Últimos ángulos de servo recibidos (para calcular delta del hombro sobre el codo)
+  let lastServo1 = 180; // valor inicial coherente con armState.elbow = -2.7 → (180-90)-180 = -90°... ajustado abajo
+  let lastServo2 = 90;  // hombro en reposo = 90° → delta 0
+
+  miBus.subscribe("#", (topic, msg) => {
+    if (!topic.endsWith("arm/joint_state") || !msg.action) return;
+
+    if (msg.action === "set_angles") {
+      // Servo 3 (base): -90 a 90° → rotación Y del turntable
+      if (msg.servo3 !== undefined) {
+        armState.rot_y = -msg.servo3 * (Math.PI / 180);
+      }
+
+      // Actualizar valores recibidos
+      if (msg.servo2 !== undefined) lastServo2 = msg.servo2;
+      if (msg.servo1 !== undefined) lastServo1 = msg.servo1;
+
+      // Servo 2 (hombro): mapeo original v24
+      armState.shoulder = (90 - lastServo2) * (Math.PI / 180);
+
+      // Servo 1 (codo): mapeo con -90° visual + delta del hombro respecto a 90°
+      // Si hombro > 90° → sumar esos grados al codo; si < 90° → restar
+      const shoulderDelta = lastServo2 - 90;
+      armState.elbow = ((lastServo1 + shoulderDelta - 90) - 180) * (Math.PI / 180);
+    }
+
+    if (msg.rotation_deg !== undefined && msg.action !== "set_angles") {
+      armState.rot_y = -msg.rotation_deg * (Math.PI / 180);
+    }
+    if (msg.action === "extend") {
+      armState.shoulder = -0.5;   
+      armState.elbow = -1.07;     
+    }
+    if (msg.action === "contract") {
+      armState.shoulder = 0.5;  
+      armState.elbow = -2.7;      
+    }
+  });
+
+  let lastTime = performance.now();
+  function animate(now) {
+    const dt = Math.min((now - lastTime)/1000, 0.1); 
+    lastTime = now;
+    
+    // Animar Carro
+    if(!carCur && carQueue.length) { 
+        carCur = carQueue.shift(); carT=0; 
+        carCur.startX=carPos.x; carCur.startY=carPos.y; carCur.startBeta=carPos.beta; 
+    }
+    if(carCur) {
+      carT += dt;
+      if (carCur.type === "linear") {
+        const prog = Math.min(carT / (Math.abs(carCur.dist)/4), 1);
+        carPos.x = carCur.startX + (carCur.dist*prog) * Math.sin(carCur.startBeta);
+        carPos.y = carCur.startY + (carCur.dist*prog) * Math.cos(carCur.startBeta);
+        if(prog>=1) carCur = null;
+      } else if (carCur.type === "arc") {
+          const prog = Math.min(carT / (Math.abs(carCur.angle) / 2), 1);
+          const swept = carCur.angle * prog;
+          // Giro de tanque: solo rota, no se desplaza
+          carPos.beta = carCur.startBeta + swept;
+          if (prog >= 1) carCur = null;
+      }
+    }
+    carGroup.position.set(carPos.x, 0, carPos.y); 
+    carGroup.rotation.y = carPos.beta;
+    carWorld.controls.update();
+    carWorld.renderer.render(carWorld.scene, carWorld.camera);
+
+    // Animar Brazo Mecánico (LERP suave)
+    const LERP_SPEED = 5;
+    armCur.rot_y    += (armState.rot_y - armCur.rot_y) * LERP_SPEED * dt;
+    armCur.shoulder += (armState.shoulder - armCur.shoulder) * LERP_SPEED * dt;
+    armCur.elbow    += (armState.elbow - armCur.elbow) * LERP_SPEED * dt;
+
+    // Aplicar rotaciones
+    turntable.rotation.y = armCur.rot_y;
+    shoulderJoint.rotation.x = armCur.shoulder; 
+    elbowJoint.rotation.x = armCur.elbow; 
+
+    // SECRETO DE LA CINEMÁTICA DEL MEARM:
+    // Mantener siempre la garra apuntando horizontalmente hacia el frente (-Z).
+    // Ecuación: hombro + codo + muñeca = -90 grados (-Pi/2)
+    wristJoint.rotation.x = -Math.PI / 2 - (armCur.shoulder + armCur.elbow);
+
+    armWorld.controls.update();
+    armWorld.renderer.render(armWorld.scene, armWorld.camera);
+
+    requestAnimationFrame(animate);
+  }
+  requestAnimationFrame(animate);
+  </script>
+  </div>
+</body>
+</html>
